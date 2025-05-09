@@ -553,6 +553,233 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
 
     // -------- YOUR CODE HERE  -------- //
 
+    // func to access 4D tensor elements
+    auto get_elem = [&](const std::vector<float> &tensor, int batch, int head, int row, int col) -> float {
+        int idx = batch * (H * N * d) + head * (N * d) + row * d + col;
+        return tensor[idx];
+    };
+
+    // func to set 4D tensor elements
+    auto set_elem = [&](std::vector<float> &tensor, int batch, int head, int row, int col, float val) {
+        int idx = batch * (H * N * d) + head * (N * d) + row * d + col;
+        tensor[idx] = val;
+    };
+
+    // func to access 2D tensor elements
+    auto get_2d = [](const std::vector<float> &tensor, int row, int col, int cols) -> float {
+        return tensor[row * cols + col];
+    };
+
+    // func to set 2D tensor elements
+    auto set_2d = [](std::vector<float> &tensor, int row, int col, int cols, float val) {
+        tensor[row * cols + col] = val;
+    };
+
+    // temporary vector to help with accumulation
+    std::vector<float> row_sums(Br, 0.0f);
+
+    // process each batch
+    int batch_idx = 0;
+    while (batch_idx < B) {
+        int head_idx = 0;
+        while (head_idx < H) {
+            for (int row_block = 0; row_block < N; row_block += Br) {
+                // init accumulators
+                for (int local_row = 0; local_row < Br; local_row++) {
+                    // check if within bounds
+                    int global_row = row_block + local_row;
+                    if (global_row < N) {
+                        // init li with -infinity for max finding
+                        li[local_row] = -std::numeric_limits<float>::infinity();
+
+                        // initialize lnew accumulator to zero
+                        lnew[local_row] = 0.0f;
+
+                        // initialize row sum to zero
+                        row_sums[local_row] = 0.0f;
+
+                        // initialize output accumulator for this row to zeros
+                        int dim_idx = 0;
+                        while (dim_idx < d) {
+                            set_2d(Oi, local_row, dim_idx, d, 0.0f);
+                            dim_idx++;
+                        }
+                    }
+                }
+
+                // process blocks of columns
+                int col_block = 0;
+                while (col_block < N) {
+                    // adjust end point for last block that might be smaller
+                    int col_block_end = std::min(col_block + Bc, N);
+                    int actual_block_cols = col_block_end - col_block;
+
+                    for (int local_row = 0; local_row < Br; local_row++) {
+                        int global_row = row_block + local_row;
+                        if (global_row < N) {
+                            for (int dim = 0; dim < d; dim++) {
+                                float val = get_elem(Q, batch_idx, head_idx, global_row, dim);
+                                set_2d(Qi, local_row, dim, d, val);
+                            }
+                        }
+                    }
+
+                    // load Kj and Vj blocks from K and V
+                    int local_col = 0;
+                    while (local_col < actual_block_cols) {
+                        int global_col = col_block + local_col;
+
+                        // copy column data
+                        for (int dim = 0; dim < d; dim++) {
+                            float k_val = get_elem(K, batch_idx, head_idx, global_col, dim);
+                            set_2d(Kj, local_col, dim, d, k_val);
+
+                            float v_val = get_elem(V, batch_idx, head_idx, global_col, dim);
+                            set_2d(Vj, local_col, dim, d, v_val);
+                        }
+                        local_col++;
+                    }
+
+                    // calc Sij = Qi * Kj^T (matrix multiplication)
+                    for (int local_row = 0; local_row < Br; local_row++) {
+                        int global_row = row_block + local_row;
+                        if (global_row < N) {
+                            for (int local_col = 0; local_col < actual_block_cols; local_col++) {
+                                // compute dot product for this cell
+                                float dot_prod = 0.0f;
+
+                                for (int k = 0; k < d; k++) {
+                                    float qi_val = get_2d(Qi, local_row, k, d);
+                                    float kj_val = get_2d(Kj, local_col, k, d);
+                                    dot_prod += qi_val * kj_val;
+                                }
+
+                                // store result in Sij
+                                set_2d(Sij, local_row, local_col, Bc, dot_prod);
+                            }
+                        }
+                    }
+
+                    // find the max value for each row of Sij
+                    for (int local_row = 0; local_row < Br; local_row++) {
+                        int global_row = row_block + local_row;
+                        if (global_row < N) {
+                            float row_max = get_2d(Sij, local_row, 0, Bc);
+
+                            for (int local_col = 1; local_col < actual_block_cols; local_col++) {
+                                float val = get_2d(Sij, local_row, local_col, Bc);
+                                if (val > row_max) {
+                                    row_max = val;
+                                }
+                            }
+
+                            // lij = max
+                            lij[local_row] = row_max;
+                        }
+                    }
+
+                    // Pij = exp(Sij - lij) and row sums
+                    for (int local_row = 0; local_row < Br; local_row++) {
+                        int global_row = row_block + local_row;
+                        if (global_row < N) {
+                            // get max value for this row
+                            float max_val = lij[local_row];
+
+                            // compute sum of exponentials for this row
+                            float sum_exp = 0.0f;
+
+                            // calculate exp(Sij - lij) for each element and sum
+                            for (int local_col = 0; local_col < actual_block_cols; local_col++) {
+                                // compute exp(Sij[i,j] - lij[i])
+                                float s_val = get_2d(Sij, local_row, local_col, Bc);
+                                float shifted = s_val - max_val;
+                                float exp_val = std::exp(shifted);
+
+                                // store in Pij
+                                set_2d(Pij, local_row, local_col, Bc, exp_val);
+
+                                // add to sum
+                                sum_exp += exp_val;
+                            }
+
+                            // store row sum
+                            row_sums[local_row] = sum_exp;
+                        }
+                    }
+
+                    // compute PV = Pij * Vj
+                    for (int local_row = 0; local_row < Br; local_row++) {
+                        int global_row = row_block + local_row;
+                        if (global_row < N) {
+                            for (int dim = 0; dim < d; dim++) {
+                                float pv_sum = 0.0f;
+
+                                for (int local_col = 0; local_col < actual_block_cols; local_col++) {
+                                    float p_val = get_2d(Pij, local_row, local_col, Bc);
+                                    float v_val = get_2d(Vj, local_col, dim, d);
+                                    pv_sum += p_val * v_val;
+                                }
+
+                                set_2d(PV, local_row, dim, d, pv_sum);
+                            }
+                        }
+                    }
+
+                    // update accumulators (Oi and lnew)
+                    for (int local_row = 0; local_row < Br; local_row++) {
+                        int global_row = row_block + local_row;
+                        if (global_row < N) {
+                            // get previous and current max values
+                            float prev_max = li[local_row];
+                            float curr_max = lij[local_row];
+
+                            // compute scaling factor
+                            float scale_factor = std::exp(prev_max - curr_max);
+
+                            // update the normalizing factor
+                            float old_lnew = lnew[local_row];
+                            float new_lnew = scale_factor * old_lnew + row_sums[local_row];
+                            lnew[local_row] = new_lnew;
+
+                            // update output accumulators
+                            for (int dim = 0; dim < d; dim++) {
+                                float old_oi = get_2d(Oi, local_row, dim, d);
+                                float pv_val = get_2d(PV, local_row, dim, d);
+
+                                // scale and add
+                                float new_oi = scale_factor * old_oi + pv_val;
+                                set_2d(Oi, local_row, dim, d, new_oi);
+                            }
+
+                            // li = max
+                            li[local_row] = curr_max;
+                        }
+                    }
+
+                    col_block += Bc;
+                }
+
+                // normalize final outputs and write to O
+                for (int local_row = 0; local_row < Br; local_row++) {
+                    int global_row = row_block + local_row;
+                    if (global_row < N) {
+                        float norm_factor = lnew[local_row];
+
+                        for (int dim = 0; dim < d; dim++) {
+                            float oi_val = get_2d(Oi, local_row, dim, d);
+                            float normalized = oi_val / norm_factor;
+
+                            // write to output tensor
+                            set_elem(O, batch_idx, head_idx, global_row, dim, normalized);
+                        }
+                    }
+                }
+            }
+            head_idx++;
+        }
+        batch_idx++;
+    }
+
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
