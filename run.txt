@@ -1,0 +1,16 @@
+# steps for running the code in Google Colab
+# install and create venv
+!apt-get install python3.10-venv -y
+!python3.10 -m venv gpt149-env
+
+
+# install requirements
+!apt-get install ninja-build -y
+!gpt149-env/bin/pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 numpy==1.26 ninja tiktoken
+
+# clone repo and cd into it
+!git clone https://github.com/AsjadSiddiqui/pdc-asst-4.git
+%cd pdc-asst-4
+
+# run using venv
+!../gpt149-env/bin/python3 gpt149.py part0 --inference -m shakes128
