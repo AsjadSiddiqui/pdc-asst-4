@@ -400,6 +400,17 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
 //                 PART 3: FUSED ATTENTION     	              //
 // ---------------------------------------------------------- //
 
+// helper function to calculate flattened 4d index
+inline int calc_4d_index(const int &batch, const int &head, const int &seq, const int &embed,
+                         const int &heads_dim, const int &seq_dim, const int &embed_dim) {
+    int res = batch * (heads_dim * seq_dim * embed_dim) +
+              head * (seq_dim * embed_dim) +
+              seq * embed_dim +
+              embed;
+
+    return res;
+}
+
 torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, torch::Tensor VTensor, torch::Tensor temp,
                                int B, int H, int N, int d) {
     // Q, K, V are passed in with Shape: (B, H, N, d)
@@ -419,54 +430,39 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     //  You can simply access this as ORow[i]
     std::vector<float> ORow = formatTensor(ORowTensor);
 
-    // helper function to calculate flattened 4d index using a different approach
-    // defined inside the outer function
-    inline int calc_4d_index(const int &batch, const int &head, const int &seq, const int &embed,
-                             const int &heads_dim, const int &seq_dim, const int &embed_dim) {
-        // calculate index using a different formula approach
-        return batch * (heads_dim * seq_dim * embed_dim) +
-               head * (seq_dim * embed_dim) +
-               seq * embed_dim +
-               embed;
-    }
-
 // -------- YOUR CODE HERE  -------- //
 // We give you a template of the first three loops for your convenience
 #pragma omp parallel for collapse(3)
-    // loop over batch
     for (int b = 0; b < B; b++) {
-        // loop over heads
         for (int h = 0; h < H; h++) {
             for (int i = 0; i < N; i++) {
                 // ORow is moved inside so each OpenMP thread gets a local copy.
                 at::Tensor ORowTensor = temp.index({torch::indexing::Slice(omp_get_thread_num(), torch::indexing::None)});
                 std::vector<float> ORow = formatTensor(ORowTensor);
 
-                // step 1: calculate one row of Q*K^T (dot product between Q_i and all K_j)
+                // calculate one row of Q*K^T
+                // dot product between Q_i and all K_j
                 int j_idx = 0;
                 while (j_idx < N) {
-                    // calculate dot product between row i of Q and row j of K
                     float row_dot_product = 0.0f;
 
-                    // compute dot product across embedding dimension
                     int k_dim = 0;
                     while (k_dim < d) {
-                        // get values from Q and K using our custom indexing function
+                        // get values from Q and K using indexing func
                         float q_element = Q[calc_4d_index(b, h, i, k_dim, H, N, d)];
                         float k_element = K[calc_4d_index(b, h, j_idx, k_dim, H, N, d)];
 
-                        // accumulate product
+                        // sum of dot products
                         row_dot_product += q_element * k_element;
                         k_dim++;
                     }
 
-                    // store result in our temporary row vector
+                    // store the result in ORow
                     ORow[j_idx] = row_dot_product;
                     j_idx++;
                 }
 
-                // step 2: apply softmax on the row
-                // 2.1: find the max value for numerical stability (not in the sample solution)
+                // apply softmax
                 float max_val = ORow[0];
                 for (int m = 1; m < N; m++) {
                     if (ORow[m] > max_val) {
@@ -474,25 +470,22 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                     }
                 }
 
-                // 2.2: compute exponentials and sum
+                // exponentials and sum
                 float exponential_sum = 0.0f;
                 for (int j = 0; j < N; j++) {
-                    // subtract max for numerical stability
                     float shifted_val = ORow[j] - max_val;
                     float exp_val = exp(shifted_val);
                     ORow[j] = exp_val;
                     exponential_sum += exp_val;
                 }
 
-                // 2.3: normalize by the sum to get probabilities
                 int norm_idx = 0;
                 while (norm_idx < N) {
                     ORow[norm_idx] /= exponential_sum;
                     norm_idx++;
                 }
 
-                // step 3: compute output by multiplying normalized attention weights with V
-                // for each embedding dimension
+                // get output by multiplying normalized attention weights with V
                 for (int out_d = 0; out_d < d; out_d++) {
                     // start with zero accumulator
                     float output_val = 0.0f;
