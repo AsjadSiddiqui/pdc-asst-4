@@ -251,6 +251,146 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
 
     // -------- YOUR CODE HERE  -------- //
 
+    // block sizes for tiling
+    const int blockSizeN = 24;
+    const int blockSizeD = 24;
+
+    int batchIdx = 0;
+    while (batchIdx < B) {
+        int headIdx = 0;
+        while (headIdx < H) {
+            // init QK_t matrix wiht 0
+            int i_init = 0;
+            while (i_init < N) {
+                for (int j_init = 0; j_init < N; j_init++) {
+                    float initialize_val = 0.0f;
+                    twoDimWrite(QK_t, i_init, j_init, N, initialize_val);
+                }
+                i_init++;
+            }
+
+            for (int n_block_i = 0; n_block_i < N; n_block_i += blockSizeN) {
+                int actual_block_i = std::min(blockSizeN, N - n_block_i);
+
+                for (int n_block_j = 0; n_block_j < N; n_block_j += blockSizeN) {
+                    int actual_block_j = std::min(blockSizeN, N - n_block_j);
+
+                    for (int d_block = 0; d_block < d; d_block += blockSizeD) {
+                        int actual_block_d = std::min(blockSizeD, d - d_block);
+
+                        int block_row = 0;
+                        while (block_row < actual_block_i) {
+                            int global_row = n_block_i + block_row;
+
+                            for (int block_col = 0; block_col < actual_block_j; block_col++) {
+                                int global_col = n_block_j + block_col;
+
+                                float accumulated_value = 0.0f;
+                                if (d_block > 0) {
+                                    accumulated_value = twoDimRead(QK_t, global_row, global_col, N);
+                                }
+
+                                for (int d_idx = 0; d_idx < actual_block_d; d_idx++) {
+                                    int global_d = d_block + d_idx;
+
+                                    float q_elem = fourDimRead(Q, batchIdx, headIdx, global_row, global_d, H, N, d);
+                                    float k_elem = fourDimRead(K, batchIdx, headIdx, global_col, global_d, H, N, d);
+
+                                    // sum of dot products
+                                    accumulated_value += q_elem * k_elem;
+                                }
+
+                                // store back
+                                twoDimWrite(QK_t, global_row, global_col, N, accumulated_value);
+                            }
+                            block_row++;
+                        }
+                    }
+                }
+            }
+
+            // softmax
+            for (int row_idx = 0; row_idx < N; row_idx++) {
+                float sum_exponentials = 0.0f;
+
+                int col_idx = 0;
+                while (col_idx < N) {
+                    float current_val = twoDimRead(QK_t, row_idx, col_idx, N);
+
+                    float exponential_val = exp(current_val);
+
+                    twoDimWrite(QK_t, row_idx, col_idx, N, exponential_val);
+
+                    // sum of exponentials
+                    sum_exponentials += exponential_val;
+
+                    col_idx++;
+                }
+
+                for (int col_norm = 0; col_norm < N; col_norm++) {
+                    float exp_val = twoDimRead(QK_t, row_idx, col_norm, N);
+
+                    float normalized = exp_val / sum_exponentials;
+
+                    // save back
+                    twoDimWrite(QK_t, row_idx, col_norm, N, normalized);
+                }
+            }
+
+            // block matrix multiplication for QK_t * V
+            // zero initialize
+            for (int out_i = 0; out_i < N; out_i++) {
+                int out_j = 0;
+                while (out_j < d) {
+                    float zero_val = 0.0f;
+                    fourDimWrite(O, batchIdx, headIdx, out_i, out_j, H, N, d, zero_val);
+                    out_j++;
+                }
+            }
+
+            // process blocks of the output matrix O (N x d)
+            for (int n_block_i = 0; n_block_i < N; n_block_i += blockSizeN) {
+                int actual_block_i = std::min(blockSizeN, N - n_block_i);
+
+                for (int d_block_j = 0; d_block_j < d; d_block_j += blockSizeD) {
+                    int actual_block_d = std::min(blockSizeD, d - d_block_j);
+
+                    for (int n_block_k = 0; n_block_k < N; n_block_k += blockSizeN) {
+                        int actual_block_k = std::min(blockSizeN, N - n_block_k);
+
+                        for (int block_i = 0; block_i < actual_block_i; block_i++) {
+                            int global_i = n_block_i + block_i;
+
+                            int block_j = 0;
+                            while (block_j < actual_block_d) {
+                                int global_j = d_block_j + block_j;
+
+                                float result_sum = fourDimRead(O, batchIdx, headIdx, global_i, global_j, H, N, d);
+
+                                for (int block_k = 0; block_k < actual_block_k; block_k++) {
+                                    int global_k = n_block_k + block_k;
+
+                                    float qk_elem = twoDimRead(QK_t, global_i, global_k, N);
+                                    float v_elem = fourDimRead(V, batchIdx, headIdx, global_k, global_j, H, N, d);
+
+                                    result_sum += qk_elem * v_elem;
+                                }
+
+                                // store the result
+                                fourDimWrite(O, batchIdx, headIdx, global_i, global_j, H, N, d, result_sum);
+
+                                block_j++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            headIdx++;
+        }
+        batchIdx++;
+    }
+
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
