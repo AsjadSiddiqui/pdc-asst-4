@@ -252,8 +252,8 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     // -------- YOUR CODE HERE  -------- //
 
     // block sizes for tiling
-    const int blockSizeN = 128;
-    const int blockSizeD = 128;
+    const int blockSizeN = 256;
+    const int blockSizeD = 64;
 
     int batchIdx = 0;
     while (batchIdx < B) {
