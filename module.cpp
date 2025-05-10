@@ -430,9 +430,9 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     //  You can simply access this as ORow[i]
     std::vector<float> ORow = formatTensor(ORowTensor);
 
-// -------- YOUR CODE HERE  -------- //
-// We give you a template of the first three loops for your convenience
-#pragma omp parallel for collapse(3)
+    // -------- YOUR CODE HERE  -------- //
+    // We give you a template of the first three loops for your convenience
+    // #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
             for (int i = 0; i < N; i++) {
